@@ -130,7 +130,7 @@ def extract_log_content(path: str) -> str | None:
 
      
 # OpenAI client
-openai.api_key = "your-api-key-here"
+openai.api_key = "Keep API here"
 
 # SYSTEM_PROMPT
 SYSTEM_PROMPT = """
@@ -289,10 +289,13 @@ async def websocket_endpoint(websocket: WebSocket):
             )
 
             # Send tokens as they arrive
-            async for chunk in response:
-                content = chunk.choices[0].delta.content
-                if content:
-                    await websocket.send_text(content)
+            full_response = ""
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                if hasattr(delta, "content") and delta.content:
+                    token = delta.content
+                    full_response += token
+                    await websocket.send_text(token)
 
             await websocket.send_text("[DONE]")
     except WebSocketDisconnect:
