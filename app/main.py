@@ -1,5 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
@@ -8,11 +7,11 @@ import faiss
 import numpy as np
 import openai
 import tiktoken
+from openai.types.chat import ChatCompletionChunk
 
-# Initialize FastAPI
 app = FastAPI()
 
-# CORS
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,22 +29,29 @@ dimension = 384
 index = faiss.IndexFlatL2(dimension)
 stored_chunks = []
 
-# Chunking and size limit
 CHUNK_SIZE = 500
-MAX_CHUNKS = 10000  # Limit for the number of chunks allowed
 
-# Dummy embedding function
 def fake_embed(text):
     np.random.seed(abs(hash(text)) % (10**8))
     return np.random.rand(dimension).astype("float32")
 
-# Token counter using tiktoken
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
 def count_tokens(text):
     return len(tokenizer.encode(text))
 
-# Extract and save logs from zip/gz with limit
+def extract_log_content(path: str) -> str | None:
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        else:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+    except Exception as e:
+        print(f"Failed to read {path}: {e}")
+        return None
+
 def extract_and_save(uploaded_file: UploadFile):
     folder = "extracted_logs"
     if os.path.exists(folder):
@@ -59,48 +65,28 @@ def extract_and_save(uploaded_file: UploadFile):
         shutil.copyfileobj(uploaded_file.file, f)
 
     logs = []
-    total_chunks = 0
 
     try:
         if file_ext.endswith(".zip"):
             with zipfile.ZipFile(temp_path, 'r') as zip_ref:
                 zip_ref.extractall(folder)
-
-            # Walk through extracted contents
             for root, _, files in os.walk(folder):
                 for name in files:
                     path = os.path.join(root, name)
                     if name.endswith(".log") or name.endswith(".gz"):
                         content = extract_log_content(path)
-                        if content is None:
-                            continue
-
-                        num_chunks = len(content) // CHUNK_SIZE + (1 if len(content) % CHUNK_SIZE else 0)
-                        total_chunks += num_chunks
-
-                        if total_chunks > MAX_CHUNKS:
-                            print("Exceeded chunk limit")
-                            return False
-
-                        logs.append({"filename": name, "content": content})
-        elif file_ext.endswith(".gz"):
+                        if content:
+                            logs.append({"filename": name, "content": content})
+        elif file_ext.endswith(".gz") or file_ext.endswith(".log"):
             content = extract_log_content(temp_path)
-            if content is None:
-                return False
-
-            num_chunks = len(content) // CHUNK_SIZE + (1 if len(content) % CHUNK_SIZE else 0)
-            if num_chunks > MAX_CHUNKS:
-                print("Exceeded chunk limit")
-                return False
-
-            logs.append({"filename": uploaded_file.filename, "content": content})
+            if content:
+                logs.append({"filename": uploaded_file.filename, "content": content})
         else:
             return False
     except Exception as e:
         print("Extraction error:", e)
         return False
 
-    # Save logs to DB and FAISS
     if logs:
         collection.delete_many({})
         collection.insert_many(logs)
@@ -116,90 +102,87 @@ def extract_and_save(uploaded_file: UploadFile):
 
     return True
 
-def extract_log_content(path: str) -> str | None:
-    try:
-        if path.endswith(".gz"):
-            with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        else:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-    except Exception as e:
-        print(f"Failed to read {path}: {e}")
-        return None
+openai.api_key = "keep API here"
 
-     
-# OpenAI client
-openai.api_key = "Keep API here please"
-
-# SYSTEM_PROMPT
 SYSTEM_PROMPT = """
-You are a senior Java backend engineer with deep expertise in log analysis and diagnosing production issues using incomplete, fragmented, or noisy runtime logs.
+You are a senior Java backend engineer and expert in log analysis. Your job is to help identify errors, their causes, and patterns in Java production logs.
 
-## Context:
-You will be given **log chunks** retrieved from a vector store. These are from Java applications and may include:
+### Context:
+You will receive **log chunk(s)**. These logs may include:
 - Stack traces
-- Exception messages
-- Thread states
-- GC activity
-- Debug statements
-- Timestamps and logs from different services
+- Exceptions and error messages
+- GC logs
+- Thread dumps
+- Application-level debug/info logs
+- Timestamps, thread names, component/service markers
 
-These logs may be out of order, partial, or truncated.
+Logs may be fragmented, out-of-order, repetitive, or partially truncated.
 
-## Task:
-Analyze the provided chunks to answer a question related to Java application behavior. Use structured reasoning. If context is insufficient, clearly state that more detail is required.
+---
 
-## Audience:
-Your explanation is for engineers and DevOps teams. Avoid speculation, and base your output strictly on the log data.
+### Tasks & Output Rules:
 
-## Response Format:
-Always answer using the following structure:
+Adapt your response based on the question type:
 
-### Observation:
-Summarize what is explicitly seen in the log chunks (errors, patterns, timestamps, stack traces, etc.).
+--- 
 
-### Interpretation:
-Explain what these observations mean in the context of Java runtime behavior.
+🟢 **1. For counts or grouped data (e.g., "how many exceptions"):**
+- Use a **Markdown table** with appropriate columns:
+  - Exception Type
+  - Count
+  - First Occurrence Timestamp (if available)
+  - Threads involved
 
-### Hypothesis / Implication:
-Suggest what the likely root cause or consequence could be. If information is incomplete, say what additional data would help.
+🟢 **2. For root cause analysis of an exception:**
+- Trace the relevant stack trace and related context.
+- Output using Markdown with sections:
+  - **🔍 Root Cause**
+  - **📍 Location**
+  - **🧠 Suggestion**
 
-## Notes:
-- For logs with fewer than 10 lines, format using Markdown.
-- For longer or multi-part logs, present relevant sections in a **table format** with columns: `Timestamp`, `Log Level`, `Message`.
-- If logs are unrelated to the question, state: _"No relevant log entries were found in the retrieved chunks."_
+🟢 **3. For general diagnostics (e.g., “is anything wrong?”):**
+- Summarize using labeled bullet points:
+  - ✅ Healthy signs
+  - ⚠️ Warnings
+  - ❌ Critical errors
+  - 🧩 Observed patterns
 
-## Additional Instructions:
-- If the user's message appears to be a greeting (e.g., "hi", "hello", "good morning"), respond briefly and politely, acknowledging the greeting before asking for a specific question related to the logs.
-- Do not ignore or dismiss greetings, but keep the response concise and professional
-Be precise, conservative, and structured. Use headings and formatting to improve clarity.
+🔢 **4. Whenever your answer includes structured records (lists of items):**
+- Format them as a **Markdown table**.
+- Use clear headers and readable rows (avoid long cells).
+- Use this formatting even if the user didn’t explicitly ask for a table.
+
+---
+
+If context is insufficient:
+Say clearly: "_More log context is required to make a definitive conclusion._"
+
+If logs are irrelevant:
+Say clearly: "_No relevant log entries found._"
+
+Your audience is backend engineers and SREs. Be technical, structured, and avoid speculation.
 """
 
-# Ask GPT with logs as context
+
 def ask_question_to_gpt(question: str):
     if not stored_chunks or index.ntotal == 0:
         return "No logs found. Please upload the logs."
 
-    needs_full_context = any(word in question.lower() for word in [
-        "how many", "count", "list all", "show all", "give me all"
-    ])
+    question_vec = fake_embed(question)
+    _, I = index.search(np.array([question_vec]), k=20)
+    top_chunks = sorted(
+        [(stored_chunks[i][0], np.linalg.norm(question_vec - stored_chunks[i][1])) for i in I[0]],
+        key=lambda x: x[1]
+    )[:5]
+    context_chunks = [chunk for chunk, _ in top_chunks]
 
-    if needs_full_context:
-        context_chunks = [chunk for chunk, _ in stored_chunks]
-    else:
-        question_vec = fake_embed(question)
-        _, I = index.search(np.array([question_vec]), k=5)
-        context_chunks = [stored_chunks[i][0] for i in I[0]]
-
-    MAX_TOKENS_CONTEXT = 100000
+    MAX_TOKENS_CONTEXT = 6000
     current_tokens = 0
     final_chunks = []
 
     for chunk in context_chunks:
         chunk_tokens = count_tokens(chunk)
         if current_tokens + chunk_tokens > MAX_TOKENS_CONTEXT:
-            print("Exceeded")
             break
         final_chunks.append(chunk)
         current_tokens += chunk_tokens
@@ -216,7 +199,7 @@ Answer:
 """
 
     response = openai.chat.completions.create(
-        model="gpt-4",
+        model="gpt-4.1",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT.strip()},
             {"role": "user", "content": prompt.strip()}
@@ -226,15 +209,13 @@ Answer:
 
     return response.choices[0].message.content.strip()
 
-# Upload endpoint with limit check
 @app.post("/upload")
 async def upload_log(file: UploadFile = File(...)):
     success = extract_and_save(file)
     if not success:
-        return JSONResponse(status_code=413, content={"error": "Log size exceeds allowed limit."})
+        return JSONResponse(status_code=413, content={"error": "Log extraction failed or unsupported format."})
     return JSONResponse(content={"message": "Logs uploaded and processed"})
 
-# Ask endpoint
 @app.post("/ask")
 async def ask_question(question: str = Form(...)):
     answer = ask_question_to_gpt(question)
@@ -250,16 +231,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if not stored_chunks or index.ntotal == 0:
                 await websocket.send_text("No logs found. Please upload the logs first.")
+                await websocket.send_text("[DONE]")
                 continue
 
             question_vec = fake_embed(question)
-            _, I = index.search(np.array([question_vec]), k=5)
-            context_chunks = [stored_chunks[i][0] for i in I[0]]
+            _, I = index.search(np.array([question_vec]), k=20)
+            top_chunks = sorted(
+                [(stored_chunks[i][0], np.linalg.norm(question_vec - stored_chunks[i][1])) for i in I[0]],
+                key=lambda x: x[1]
+            )[:5]
+            context_chunks = [chunk for chunk, _ in top_chunks]
 
-            # Truncate to token limit
             final_chunks = []
             current_tokens = 0
-            MAX_TOKENS_CONTEXT = 100000
+            MAX_TOKENS_CONTEXT = 6000
             for chunk in context_chunks:
                 chunk_tokens = count_tokens(chunk)
                 if current_tokens + chunk_tokens > MAX_TOKENS_CONTEXT:
@@ -268,38 +253,49 @@ async def websocket_endpoint(websocket: WebSocket):
                 current_tokens += chunk_tokens
 
             context = "\n---\n".join(final_chunks)
-            prompt = f"""
-                    Context:
-                    {context}
+            prompt_user = f"""
+Context:
+{context}
 
-                    Question:
-                    {question}
+Question:
+{question}
 
-                    Answer:
-                    """
+Answer:
+"""
 
-            #STREAMING GPT CALL
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT.strip()},
+                {"role": "user", "content": prompt_user.strip()}
+            ]
+
+            full_prompt_text = SYSTEM_PROMPT.strip() + prompt_user.strip()
+            input_tokens = count_tokens(full_prompt_text)
+            print(f"[TOKEN USAGE] Input tokens: {input_tokens}", flush=True)
+
+            full_response = ""
             response = openai.chat.completions.create(
                 model="gpt-4",
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT.strip()},
-                    {"role": "user", "content": prompt.strip()}
-                ],
+                messages=messages,
                 stream=True
             )
 
-            # Send tokens as they arrive
-            full_response = ""
             for chunk in response:
-                delta = chunk.choices[0].delta
-                if hasattr(delta, "content") and delta.content:
-                    token = delta.content
-                    full_response += token
-                    await websocket.send_text(token)
+                if isinstance(chunk, ChatCompletionChunk):
+                    delta = chunk.choices[0].delta
+                    if hasattr(delta, "content") and delta.content:
+                        token = delta.content
+                        full_response += token
+                        await websocket.send_text(token)
+
+            output_tokens = count_tokens(full_response)
+            print(f"[TOKEN USAGE] Output tokens: {output_tokens}", flush=True)
+            print(f"[TOKEN USAGE] Total tokens: {input_tokens + output_tokens}", flush=True)
 
             await websocket.send_text("[DONE]")
+
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
         print("Error:", e)
         await websocket.send_text("Error while processing question.")
+        await websocket.send_text("[DONE]")
