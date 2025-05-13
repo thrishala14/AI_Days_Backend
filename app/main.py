@@ -1,11 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pymongo import MongoClient
 import os, zipfile, shutil, uuid, gzip
 import faiss
 import numpy as np
-from openai import OpenAI
+import openai
 import tiktoken
 
 # Initialize FastAPI
@@ -45,44 +46,61 @@ def count_tokens(text):
     return len(tokenizer.encode(text))
 
 # Extract and save logs from zip/gz with limit
-def extract_and_save(zip_file: UploadFile):
+def extract_and_save(uploaded_file: UploadFile):
     folder = "extracted_logs"
     if os.path.exists(folder):
         shutil.rmtree(folder)
     os.makedirs(folder, exist_ok=True)
 
-    zip_path = os.path.join(folder, "temp.zip")
-    with open(zip_path, "wb") as f:
-        f.write(zip_file.file.read())
+    file_ext = uploaded_file.filename.lower()
+    temp_path = os.path.join(folder, uploaded_file.filename)
 
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(folder)
+    with open(temp_path, "wb") as f:
+        shutil.copyfileobj(uploaded_file.file, f)
 
     logs = []
     total_chunks = 0
-    for root, dirs, files in os.walk(folder):
-        for name in files:
-            path = os.path.join(root, name)
-            if name.endswith(".log") or name.endswith(".gz"):
-                try:
-                    if name.endswith(".gz"):
-                        with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as gzfile:
-                            content = gzfile.read()
-                    else:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as logf:
-                            content = logf.read()
 
-                    num_chunks = len(content) // CHUNK_SIZE + (1 if len(content) % CHUNK_SIZE else 0)
-                    total_chunks += num_chunks
+    try:
+        if file_ext.endswith(".zip"):
+            with zipfile.ZipFile(temp_path, 'r') as zip_ref:
+                zip_ref.extractall(folder)
 
-                    if total_chunks > MAX_CHUNKS:
-                        print("Exceeded")
-                        return False  # Limit exceeded
+            # Walk through extracted contents
+            for root, _, files in os.walk(folder):
+                for name in files:
+                    path = os.path.join(root, name)
+                    if name.endswith(".log") or name.endswith(".gz"):
+                        content = extract_log_content(path)
+                        if content is None:
+                            continue
 
-                    logs.append({"filename": name, "content": content})
-                except Exception as e:
-                    print(f"Failed to extract {name}: {e}")
+                        num_chunks = len(content) // CHUNK_SIZE + (1 if len(content) % CHUNK_SIZE else 0)
+                        total_chunks += num_chunks
 
+                        if total_chunks > MAX_CHUNKS:
+                            print("Exceeded chunk limit")
+                            return False
+
+                        logs.append({"filename": name, "content": content})
+        elif file_ext.endswith(".gz"):
+            content = extract_log_content(temp_path)
+            if content is None:
+                return False
+
+            num_chunks = len(content) // CHUNK_SIZE + (1 if len(content) % CHUNK_SIZE else 0)
+            if num_chunks > MAX_CHUNKS:
+                print("Exceeded chunk limit")
+                return False
+
+            logs.append({"filename": uploaded_file.filename, "content": content})
+        else:
+            return False
+    except Exception as e:
+        print("Extraction error:", e)
+        return False
+
+    # Save logs to DB and FAISS
     if logs:
         collection.delete_many({})
         collection.insert_many(logs)
@@ -98,8 +116,21 @@ def extract_and_save(zip_file: UploadFile):
 
     return True
 
+def extract_log_content(path: str) -> str | None:
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, 'rt', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        else:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+    except Exception as e:
+        print(f"Failed to read {path}: {e}")
+        return None
+
+     
 # OpenAI client
-client = OpenAI(api_key="put API key here")
+openai.api_key = "your-api-key-here"
 
 # SYSTEM_PROMPT
 SYSTEM_PROMPT = """
@@ -148,7 +179,7 @@ Be precise, conservative, and structured. Use headings and formatting to improve
 # Ask GPT with logs as context
 def ask_question_to_gpt(question: str):
     if not stored_chunks or index.ntotal == 0:
-        return "No logs found. Please upload logs first using the /upload endpoint."
+        return "No logs found. Please upload the logs."
 
     needs_full_context = any(word in question.lower() for word in [
         "how many", "count", "list all", "show all", "give me all"
@@ -184,12 +215,13 @@ Question:
 Answer:
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4.1",
+    response = openai.chat.completions.create(
+        model="gpt-4",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT.strip()},
             {"role": "user", "content": prompt.strip()}
-        ]
+        ],
+        stream=False
     )
 
     return response.choices[0].message.content.strip()
@@ -207,3 +239,64 @@ async def upload_log(file: UploadFile = File(...)):
 async def ask_question(question: str = Form(...)):
     answer = ask_question_to_gpt(question)
     return JSONResponse(content={"answer": answer})
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            question = await websocket.receive_text()
+            print(f"Received from client: {question}")
+
+            if not stored_chunks or index.ntotal == 0:
+                await websocket.send_text("No logs found. Please upload the logs first.")
+                continue
+
+            question_vec = fake_embed(question)
+            _, I = index.search(np.array([question_vec]), k=5)
+            context_chunks = [stored_chunks[i][0] for i in I[0]]
+
+            # Truncate to token limit
+            final_chunks = []
+            current_tokens = 0
+            MAX_TOKENS_CONTEXT = 100000
+            for chunk in context_chunks:
+                chunk_tokens = count_tokens(chunk)
+                if current_tokens + chunk_tokens > MAX_TOKENS_CONTEXT:
+                    break
+                final_chunks.append(chunk)
+                current_tokens += chunk_tokens
+
+            context = "\n---\n".join(final_chunks)
+            prompt = f"""
+                    Context:
+                    {context}
+
+                    Question:
+                    {question}
+
+                    Answer:
+                    """
+
+            #STREAMING GPT CALL
+            response = openai.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT.strip()},
+                    {"role": "user", "content": prompt.strip()}
+                ],
+                stream=True
+            )
+
+            # Send tokens as they arrive
+            async for chunk in response:
+                content = chunk.choices[0].delta.content
+                if content:
+                    await websocket.send_text(content)
+
+            await websocket.send_text("[DONE]")
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        print("Error:", e)
+        await websocket.send_text("Error while processing question.")
