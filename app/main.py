@@ -130,7 +130,7 @@ def extract_log_content(path: str) -> str | None:
 
      
 # OpenAI client
-openai.api_key = "Keep API here"
+openai.api_key = "Keep API here please"
 
 # SYSTEM_PROMPT
 SYSTEM_PROMPT = """
