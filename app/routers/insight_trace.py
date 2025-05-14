@@ -12,11 +12,6 @@ async def upload_log(file: UploadFile = File(...)):
         return JSONResponse(status_code=413, content={"error": "Log extraction failed or unsupported format."})
     return JSONResponse(content={"message": "Logs uploaded and processed"})
 
-@router.post("/ask")
-async def ask_question(question: str = Form(...)):
-    answer = ask_question_to_gpt(question)
-    return JSONResponse(content={"answer": answer})
-
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
