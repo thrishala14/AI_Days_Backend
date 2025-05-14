@@ -242,7 +242,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             question_vec = fake_embed(question)
-            _, I = index.search(np.array([question_vec]), k=20)
+            _, I = index.search(np.array([question_vec]), k=10)
             top_chunks = sorted(
                 [(stored_chunks[i][0], np.linalg.norm(question_vec - stored_chunks[i][1])) for i in I[0]],
                 key=lambda x: x[1]
