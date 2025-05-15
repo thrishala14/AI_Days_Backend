@@ -1,6 +1,7 @@
 "# AI_Days_Backend" 
 
 To Set Up and Run the Backend Application
+Open a command prompt in your IDE
 1. create a Virtual Environment : 
         python -m venv venv
 
